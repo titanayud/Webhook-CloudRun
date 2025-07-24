@@ -2,6 +2,10 @@ from flask import Flask, request, jsonify
 from google.cloud import bigquery
 import vertexai
 from vertexai.preview.generative_models import GenerativeModel
+from google.api_core.exceptions import ResourceExhausted
+import time
+import random
+import os
 
 app = Flask(__name__)
 
@@ -15,6 +19,18 @@ TABLE_ALIASES = "dm_value_aliasses"
 
 # Inisialisasi Vertex AI
 vertexai.init(project=PROJECT_ID, location=LOCATION)
+
+def safe_generate_content(model, prompt, max_attempts=5):
+    for attempt in range(max_attempts):
+        try:
+            return model.generate_content(prompt)
+        except ResourceExhausted:
+            wait_time = (2 ** attempt) + random.uniform(0, 1)
+            print(f"⚠️ 429 Error - retrying in {wait_time:.2f}s (attempt {attempt+1})")
+            time.sleep(wait_time)
+        except Exception as e:
+            raise e
+    raise Exception("Max retries reached for generate_content()")
 
 def get_table_schema():
     client = bigquery.Client()
@@ -53,6 +69,7 @@ def get_aliases():
         }
         for row in results
     ]
+
 rumus_text = """
 Rumus-rumus penting:
 - tingkat_realisasi = qty_actual / qty_budget
@@ -63,8 +80,6 @@ def generate_sql_with_gemini(question):
     column_names = get_table_schema()
     definitions = get_definitions()
     aliases = get_aliases()
-
-    column_list = ", ".join(column_names)
 
     definitions_text = "\n".join([
         f"- {d['column_name']}: {d['definition']} (contoh: {d['example_value']})"
@@ -101,26 +116,23 @@ Tulis hanya query-nya tanpa penjelasan.
 """
 
     model = GenerativeModel("gemini-2.0-flash-001")
-    response = model.generate_content(prompt)
-
+    response = safe_generate_content(model, prompt)
     sqlstring = response.text.strip()
+
     if sqlstring.startswith("```sql"):
         sqlstring = sqlstring.replace("```sql", "").replace("```", "").strip()
     elif sqlstring.startswith("```"):
         sqlstring = sqlstring.replace("```", "").strip()
 
-    # Post-processing jika Gemini masih mengembalikan SELECT *
+    # Cek jika SELECT * dan modifikasi jika perlu
     if sqlstring.strip().lower().startswith("select *"):
-        # Deteksi kata kunci dan nama perusahaan
         import re
         perusahaan = None
-        # Cek alias ke nama baku
         for a in aliases:
             if a["alias_value"].lower() in question.lower():
                 perusahaan = a["canonical_value"]
                 break
         if not perusahaan:
-            # Coba deteksi langsung nama perusahaan
             for d in ["KALTIM PRIMA COAL", "ARUTMIN INDONESIA"]:
                 if d.lower() in question.lower():
                     perusahaan = d
@@ -128,6 +140,7 @@ Tulis hanya query-nya tanpa penjelasan.
         if any(k in question.lower() for k in ["jumlah", "total", "qty_actual"]):
             where_clause = f" WHERE company LIKE '%{perusahaan}%'" if perusahaan else ""
             sqlstring = f"SELECT SUM(qty_actual) as total_qty_actual FROM `{DATASET}.{TABLE_DM}`{where_clause}"
+
     return sqlstring
 
 def run_query(sql):
@@ -148,7 +161,7 @@ Hasil query:
 Buat jawaban yang ramah dan mudah dimengerti untuk ditampilkan ke pengguna.
 """
     model = GenerativeModel("gemini-2.0-flash-001")
-    response = model.generate_content(prompt)
+    response = safe_generate_content(model, prompt)
     return response.text.strip()
 
 @app.route("/", methods=["POST"])
@@ -166,7 +179,6 @@ def webhook():
         parameters = {}
 
     try:
-        # Bisa digunakan untuk memperkaya prompt ke Gemini kalau diperlukan
         sql = generate_sql_with_gemini(question)
         print(f"Generated SQL:\n{sql}")
         rows = run_query(sql)
@@ -204,9 +216,6 @@ def webhook():
         }
     })
 
-import os
-
-port = int(os.environ.get("PORT", 8080))  # fallback to 8080 if PORT is not set
-
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
