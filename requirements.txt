@@ -1,0 +1,6 @@
+flask>=2.2.5
+google-cloud-bigquery
+google-cloud-aiplatform>=1.38.0
+google-cloud-discoveryengine>=0.11.1
+google-auth
+vertexai
